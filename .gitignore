@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+.cache/
+*.o
+*.a
+*.dpa*
+*.o.d
+*.blob
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Core dumps
+core
+*.core
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp

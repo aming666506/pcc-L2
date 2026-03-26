@@ -1,0 +1,2 @@
+option('enable_tx_counter_sampling', type: 'boolean', value: false, description: 'Enable TX counter sampling in device build')
+option('dpacc_mcpu_flag', type: 'string', value: 'nv-dpa-bf3', description: 'DPACC mcpu flag (e.g., nv-dpa-bf3)')
