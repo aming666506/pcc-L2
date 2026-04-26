@@ -30,8 +30,8 @@
  */
 
 /* 平滑后的 OWD 梯度阈值，单位 ns */
-#define OWD_HIGH_THRESH 600
-#define OWD_LOW_THRESH  -180
+#define OWD_HIGH_THRESH 300
+#define OWD_LOW_THRESH  -100
 
 /* HAI 触发阈值：连续 N 次低延迟趋势后更快加速 */
 #define OWD_HAI_THRESH  8
