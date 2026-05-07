@@ -36,6 +36,6 @@
 
 #define SIMPLE_CC_MD_MAX (1 << 16)    // fxp16格式最大值（65536，对应1.0）
 
-#define SIMPLE_CC_AI_MAX ((1<<20))    // fxp20格式最大值（1048576，对应1024Gbps）
+#define SIMPLE_CC_AI_MAX ((1<<20))    // fxp20格式最大值
 
 #endif /* SIMPLE_CC_ALGO_PARAMS_H_ */
