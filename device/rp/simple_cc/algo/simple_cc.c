@@ -30,8 +30,8 @@
  */
 
 /* 平滑后的 OWD 梯度阈值，单位 ns */
-#define OWD_HIGH_THRESH 300
-#define OWD_LOW_THRESH  -100
+#define OWD_HIGH_THRESH 80
+#define OWD_LOW_THRESH  -50
 
 /* HAI 触发阈值：连续 N 次低延迟趋势后更快加速 */
 #define OWD_HAI_THRESH  8
@@ -52,7 +52,7 @@
  * 之后每 1000 次打印一次。
  */
 #define NACK_PRINT_FIRST_N 20
-#define NACK_PRINT_INTERVAL 100
+#define NACK_PRINT_INTERVAL 3000
 
 /* --- 参数枚举 --- */
 typedef enum {
@@ -412,7 +412,7 @@ void simple_cc_algo(doca_pcc_dev_event_t *event,
 
         if (ctx->owd_hai_counter >= OWD_HAI_THRESH) {
             /* 保守 HAI：2x AI */
-            ai_factor = SIMPLE_CC_AI_FXP20 * 2;
+            ai_factor = SIMPLE_CC_AI_FXP20 * 5;
         } else {
             ai_factor = SIMPLE_CC_AI_FXP20;
         }
