@@ -51,41 +51,42 @@ pcc-demo/
 ### Initial Setup
 
 ```bash
-meson setup build --prefix=$DOCA_INSTALL_PATH
+meson setup build-longcc --prefix=/opt/mellanox/doca
 ```
 
 ### Build
 
 ```bash
-meson compile -C build
+meson compile -C build-longcc
 ```
 
 ### Clean
 
 ```bash
-meson compile -C build --clean
+meson compile -C build-longcc --clean
 ```
 
-### Full Rebuild
+### Reconfigure and rebuild
 
 ```bash
-rm -rf build && meson setup build --prefix=$DOCA_INSTALL_PATH && meson compile -C build
+meson setup --reconfigure build-longcc
+meson compile -C build-longcc
 ```
 
 ### Install
 
 ```bash
-meson install -C build
+meson install -C build-longcc
 ```
 
 ## Build Options
 
 ```bash
 # Enable TX counter sampling
-meson setup build -Denable_tx_counter_sampling=true
+meson configure build-longcc -Denable_tx_counter_sampling=true
 
 # Set DPACC MCPU flag (default: nv-dpa-bf3)
-meson setup build -Ddpacc_mcpu_flag=nv-dpa-bf3
+meson configure build-longcc -Ddpacc_mcpu_flag=nv-dpa-bf3
 ```
 
 ## Usage
@@ -93,7 +94,7 @@ meson setup build -Ddpacc_mcpu_flag=nv-dpa-bf3
 ### Basic Usage
 
 ```bash
-./build/simple_cc_host -d <RDMA device>
+./build-longcc/simple_cc_host -d <RDMA device>
 ```
 
 ### Command-Line Options
@@ -108,10 +109,10 @@ meson setup build -Ddpacc_mcpu_flag=nv-dpa-bf3
 
 ```bash
 # Run with default settings
-./build/simple_cc_host -d mlx5_0
+./build-longcc/simple_cc_host -d mlx5_0
 
 # Run with custom threads
-./build/simple_cc_host -d mlx5_0 -t "176 177 178"
+./build-longcc/simple_cc_host -d mlx5_0 -t "176 177 178"
 ```
 
 ### Signal Handlers
@@ -144,8 +145,8 @@ The only writable DOCA algorithm parameter is ID 0, the ablation mode. This repl
 The initial mode can be selected at device compilation with `LONGCC_DEFAULT_MODE=0`, `1`, `2`, or `3`. Use a separate Meson build directory for each mode because environment-variable changes alone do not trigger a rebuild:
 
 ```bash
-LONGCC_DEFAULT_MODE=2 meson setup build-fws --prefix="$DOCA_INSTALL_PATH"
-meson compile -C build-fws
+LONGCC_DEFAULT_MODE=2 meson setup build-longcc-fws --prefix=/opt/mellanox/doca
+meson compile -C build-longcc-fws
 ```
 
 The DOCA algorithm parameter callback also accepts mode changes at runtime if your management tooling supports it.
@@ -173,10 +174,10 @@ Default is CCMAD. Use `probe_packet_format` in `pcc_config_t` to change the pack
 
 ```bash
 # Receiver (ns1)
-sudo ip netns exec ns1 ./build/simple_cc_host -d mlx5_0 -f /tmp/dump1.txt
+sudo ip netns exec ns1 /root/pcc-LongCC/build-longcc/simple_cc_host -d mlx5_0
 
 # Sender (ns2)
-sudo ip netns exec ns2 ./build/simple_cc_host -d mlx5_1 -f /tmp/dump2.txt
+sudo ip netns exec ns2 /root/pcc-LongCC/build-longcc/simple_cc_host -d mlx5_1
 
 # Run bandwidth test
 sudo ip netns exec ns2 qperf -cm1 -t 30 192.168.123.1 rc_bw
@@ -186,7 +187,7 @@ sudo ip netns exec ns2 qperf -cm1 -t 30 192.168.123.1 rc_bw
 
 ```bash
 # Receiver
-sudo ip netns exec ns1 ./build/simple_cc_host -d mlx0
+sudo ip netns exec ns1 /root/pcc-LongCC/build-longcc/simple_cc_host -d mlx5_0
 
 # Sender
 sudo ip netns exec ns2 qperf -cm1 -t 30 192.168.123.1 ud_bw
@@ -243,7 +244,7 @@ Adjust `simple_cc_algo_params.h` and rebuild to change the RTT-specific threshol
 For optimal performance, configure PCC threads to run on specific CPU cores:
 
 ```bash
-./build/simple_cc_host -d mlx5_0 -t "176 177 178 179"
+./build-longcc/simple_cc_host -d mlx5_0 -t "176 177 178 179"
 ```
 
 ## Troubleshooting
@@ -251,7 +252,7 @@ For optimal performance, configure PCC threads to run on specific CPU cores:
 ### Common Issues
 
 1. **Device not found**: Ensure DOCA is installed and device supports PCC
-2. **Build failures**: Verify DOCA_INSTALL_PATH is set correctly
+2. **Build failures**: Verify the DOCA SDK is installed under `/opt/mellanox/doca`
 3. **Permission denied**: May need root privileges for RDMA device access
 
 ### Check Device PCC Support
@@ -263,8 +264,8 @@ doca_devinfo -l | grep -i pcc
 ### Verbose Build
 
 ```bash
-meson setup build --prefix=$DOCA_INSTALL_PATH -Dlog_level=debug
-meson compile -C build -v
+meson setup --reconfigure build-longcc
+meson compile -C build-longcc -v
 ```
 
 ## License
