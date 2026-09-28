@@ -27,12 +27,12 @@ _Static_assert(sizeof(simple_cc_ctxt_t) <= sizeof(doca_pcc_dev_algo_ctxt_t),
  * HAI触发阈值：
  * 连续 N 次低延迟趋势后更快加速。
  */
-#define OWD_HAI_THRESH 8
+#define OWD_HAI_THRESH 8 
 
 /*
- * OWD EWMA平滑参数：
+ * OWD EWMA平滑参数： 
  * new = (old * (N - 1) + sample) / N
- */
+ */                                      
 #define OWD_EWMA_N 8
 
 #define FWS_PERSISTENCE_SAMPLES 2
