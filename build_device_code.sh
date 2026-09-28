@@ -84,7 +84,12 @@ fi
 
 # DPA Configurations
 HOST_CC_FLAGS="-Wno-deprecated-declarations -Werror -Wall -Wextra -DFLEXIO_ALLOW_EXPERIMENTAL_API"
-DEV_CC_EXTRA_FLAGS="-DSIMX_BUILD,-ffreestanding,-mcmodel=medany,-ggdb,-O2,-DE_MODE_LE,-Wdouble-promotion"
+LONGCC_DEFAULT_MODE=${LONGCC_DEFAULT_MODE:-0}
+case "${LONGCC_DEFAULT_MODE}" in
+    0|1|2|3) ;;
+    *) echo "LONGCC_DEFAULT_MODE must be 0, 1, 2, or 3" >&2; exit 1 ;;
+esac
+DEV_CC_EXTRA_FLAGS="-DSIMX_BUILD,-ffreestanding,-mcmodel=medany,-ggdb,-O2,-DE_MODE_LE,-Wdouble-promotion,-DLONGCC_DEFAULT_MODE=${LONGCC_DEFAULT_MODE}"
 DEVICE_CC_FLAGS="-Wno-deprecated-declarations -Werror -Wall -Wextra -DFLEXIO_DEV_ALLOW_EXPERIMENTAL_API ${DEV_CC_EXTRA_FLAGS}"
 DEVICE_SOURCES_STUB_FLAGS="-Wno-attributes -Wno-pedantic -Wno-unused-parameter -Wno-return-type -fPIC"
 DEVICE_EXECS_STUB_FLAGS="-Wno-attributes -Wno-pedantic -Wno-implicit-function-declaration -fPIC -nostdlib"

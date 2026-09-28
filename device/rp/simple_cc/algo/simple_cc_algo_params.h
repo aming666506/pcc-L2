@@ -113,7 +113,7 @@ simple_cc_update_rtt_ewma_ns(uint32_t old_rtt_ns, uint32_t new_sample_ns)
     if (old_rtt_ns == 0)
         return new_sample_ns;
 
-    return ((old_rtt_ns * 7) + new_sample_ns) >> 3;
+    return (uint32_t)((((uint64_t)old_rtt_ns * 7U) + new_sample_ns) >> 3);
 }
 
 /*

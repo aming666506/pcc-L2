@@ -1,14 +1,16 @@
-# DOCA PCC Simple Congestion Control
+# LongCC DOCA PCC prototype
 
-A Programmable Congestion Control (PCC) application implementing a minimal AIMD (Additive Increase, Multiplicative Decrease) congestion control algorithm for NVIDIA BlueField DPUs.
+A DOCA Programmable Congestion Control application for NVIDIA BlueField DPUs. The active implementation combines forward delay variation, RTT-specific rate parameters, and a NACK fallback. Adaptive Probing Control (APC) is not implemented yet; every event requests the next RTT probe.
 
 ## Overview
 
-This project demonstrates DOCA PCC functionality with a simple congestion control algorithm that:
+The current device algorithm:
 
-- **Additive Increase**: Rate increases by a fixed amount on each ACK/probe
-- **Multiplicative Decrease**: Rate halves on CNP (Congestion Notification Packet) or NACK
-- **Rate Limits**: Enforces configurable minimum and maximum rate bounds
+- Computes `(recv_i - recv_(i-1)) - (send_i - send_(i-1))` from consecutive RTT probes, then applies an EWMA with weight 1/8.
+- Classifies the smoothed forward delay variation using RTT-specific high and low thresholds. In the default mode, a trend must persist for two samples before the FWS state changes.
+- Holds the sending rate during a pending FWS transition. In Growing, the rate is halved at most once per smoothed RTT. Stable uses half AI; Relieving uses AI, then 2x AI after eight continuing relief observations.
+- Applies a separate 10% decrease on every RoCE NACK. CNP and other event types leave the rate unchanged.
+- Rejects zero or discontinuous timestamp intervals above one second before using them for rate control.
 
 ## Project Structure
 
@@ -117,29 +119,36 @@ meson setup build -Ddpacc_mcpu_flag=nv-dpa-bf3
 - `SIGINT` (Ctrl+C): Graceful shutdown
 - `SIGUSR1`: Toggle debug mode / dump debug info
 
-## Algorithm Parameters
+## Algorithm parameters and ablations
 
-The Simple CC algorithm uses the following parameters defined in `device/rp/simple_cc/algo/simple_cc_algo_params.h`:
+RTT-specific thresholds and rate values are compile-time constants in `device/rp/simple_cc/algo/simple_cc_algo_params.h`. DOCA rate values use 20-bit fixed point: `1 << 20` is the configured 100 Gbps ceiling; `1 << 17` is the 12.5 Gbps minimum. The OWD thresholds are in nanoseconds.
 
-| Parameter | Description | Default Value |
-|-----------|-------------|---------------|
-| `SIMPLE_CC_MIN_RATE` | Minimum rate floor | 2^10 (1024, ~64 Mbps) |
-| `SIMPLE_CC_AI_FXP20` | Additive increase rate | 2^12 (4096, ~256 Mbps/step) |
-| `SIMPLE_CC_MD_FXP16` | Multiplicative decrease factor | 0x8000 (0.5x on congestion) |
-| `SIMPLE_CC_RATE_MAX` | Maximum rate ceiling | 2^14 (16384, ~1.56 Gbps) |
+| RTT class | High | Low | AI | MD | Minimum rate |
+|-----------|-----:|----:|---:|---:|-------------:|
+| 1 ms | 300 | -100 | 800 | 0.5 | 131072 |
+| 5 ms | 200 | -90 | 100 | 0.5 | 131072 |
+| 10 ms | 220 | -100 | 50 | 0.5 | 131072 |
+| 20 ms | 80 | -50 | 50 | 0.5 | 131072 |
+| 30 ms | 80 | -50 | 50 | 0.5 | 131072 |
+| 50 ms | 80 | -30 | 50 | 0.5 | 131072 |
 
-### Rate Calculation
+The only writable DOCA algorithm parameter is ID 0, the ablation mode. This replaces the former MD/AI/MIN_RATE parameters, which were exposed to the Host but ignored by the RTT-specific controller.
 
-Rates are represented as fixed-point values where:
-- Each unit = 2^20 / 2^20 = 1 Gbps (approximately)
-- `2^10 = 1024` units = ~1 Gbps actual bandwidth
+| Mode | FWS persistence | OWD decrease cooldown |
+|------|-----------------|-----------------------|
+| 0 (default) | On | On |
+| 1 (legacy) | Off | Off |
+| 2 (FWS only) | On | Off |
+| 3 (TRA only) | Off | On |
 
-### Algorithm Behavior
+The initial mode can be selected at device compilation with `LONGCC_DEFAULT_MODE=0`, `1`, `2`, or `3`. Use a separate Meson build directory for each mode because environment-variable changes alone do not trigger a rebuild:
 
-1. **New Flow**: Initializes rate to `MIN_RATE`
-2. **On ACK/Probe**: Apply additive increase (`rate += AI`)
-3. **On CNP/NACK**: Apply multiplicative decrease (`rate *= MD`)
-4. **Rate Clamping**: Always enforce `[MIN_RATE, MAX_RATE]` bounds
+```bash
+LONGCC_DEFAULT_MODE=2 meson setup build-fws --prefix="$DOCA_INSTALL_PATH"
+meson compile -C build-fws
+```
+
+The DOCA algorithm parameter callback also accepts mode changes at runtime if your management tooling supports it.
 
 ## Probe Packet Formats
 
@@ -151,7 +160,7 @@ The application supports multiple probe packet formats:
 | `PCC_DEV_PROBE_PACKET_IFA1` | In-band Flow Analyzer v1 |
 | `PCC_DEV_PROBE_PACKET_IFA2` | In-band Flow Analyzer v2 |
 
-Default is CCMAD. Use `probe_packet_format` in `pcc_config_t` to change.
+Default is CCMAD. Use `probe_packet_format` in `pcc_config_t` to change the packet format. This is not an adaptive probe scheduling control.
 
 ## PCC Roles
 
@@ -201,14 +210,9 @@ Send `SIGUSR1` again to dump debug information.
 
 ### Log Output
 
-The algorithm prints rate changes to the device trace buffer:
+The first 119 OWD events print RTT, delay variation, state, mode and rate information to the device trace buffer. NACK prints are limited to the first 20 events and every 100th event afterward. This diagnostic output is not a complete per-flow time series.
 
-```
-CC: rate 1024 -> 1536 (MD/AI), limits [1024, 16384]
-CC: CNP received, apply MD
-CC: rate 1536 -> 768 (MD/AI), limits [1024, 16384]
-CC: New flow started, init_rate=1024, final_rate=1024, max=16384
-```
+The algorithm counters currently track processed events and NACKs.
 
 ## Architecture
 
@@ -222,34 +226,17 @@ The host application:
 
 ### Device Side (device/)
 
-DPA kernel code that runs on the BlueField DPU:
-- Processes congestion events (CNP, NACK, probes)
-- Calculates new rates using AIMD algorithm
-- Maintains per-flow state
+DPA kernel code that runs on the BlueField DPU processes RTT probe responses and NACKs, updates the FWS state and sending rate, and maintains per-flow state in the 48-byte DOCA algorithm context.
 
 ### Key Data Structures
 
-```c
-// Flow context (per-connection state)
-typedef struct {
-    uint32_t cur_rate;      // Current sending rate
-    struct {
-        uint32_t was_cnp:1; // Was CNP received?
-        uint32_t was_nack:1; // Was NACK received?
-    } flags;
-} simple_cc_ctxt_t;
-```
+The per-flow context stores the current rate, previous probe timestamps, smoothed RTT and OWD gradient, FWS state and persistence counters, relief history, and the timestamp of the last OWD-triggered decrease.
 
 ## Performance Tuning
 
 ### Rate Parameters
 
-Adjust `simple_cc_algo_params.h` for different congestion control behaviors:
-
-- **Higher MIN_RATE**: Faster startup, less RTT gain
-- **Higher AI**: Faster convergence, potential overshoot
-- **Lower MD (closer to 1)**: Gentler decrease on congestion
-- **Higher MAX_RATE**: Allows more throughput on uncongested paths
+Adjust `simple_cc_algo_params.h` and rebuild to change the RTT-specific thresholds, AI, MD, minimum rate, or 100 Gbps ceiling. Retune and rerun the experiments after changing these values; the current values are empirical, not derived from a stability proof.
 
 ### Thread Affinity
 

@@ -15,6 +15,9 @@
 #include "simple_cc_algo_params.h"
 #include "simple_cc.h"
 
+_Static_assert(sizeof(simple_cc_ctxt_t) <= sizeof(doca_pcc_dev_algo_ctxt_t),
+               "LongCC per-flow state exceeds the DOCA PCC context");
+
 #pragma clang diagnostic ignored "-Wunused-parameter"
 
 #define SIMPLE_CC_DEBUG 0
@@ -32,8 +35,29 @@
  */
 #define OWD_EWMA_N 8
 
-/* OWD基线初值 */
-#define OWD_BASELINE_INIT 0
+#define FWS_PERSISTENCE_SAMPLES 2
+#define LONGCC_MAX_SAMPLE_INTERVAL_NS 1000000000U
+
+enum longcc_fws_state {
+    LONGCC_FWS_GROWING = 0,
+    LONGCC_FWS_STABLE = 1,
+    LONGCC_FWS_RELIEVING = 2
+};
+
+/* The mode is a live DOCA parameter, so ablations use the same binary. */
+enum longcc_mode {
+    LONGCC_MODE_CORE = 0,       /* FWS and rate decrease cooldown */
+    LONGCC_MODE_LEGACY = 1,     /* Original single-sample controller */
+    LONGCC_MODE_FWS_ONLY = 2,   /* FWS without rate decrease cooldown */
+    LONGCC_MODE_TRA_ONLY = 3    /* Cooldown without FWS persistence */
+};
+
+#ifndef LONGCC_DEFAULT_MODE
+#define LONGCC_DEFAULT_MODE LONGCC_MODE_CORE
+#endif
+
+_Static_assert(LONGCC_DEFAULT_MODE <= LONGCC_MODE_TRA_ONLY,
+               "LONGCC_DEFAULT_MODE must be between 0 and 3");
 
 /*
  * NACK降速比例：
@@ -50,12 +74,9 @@
 #define NACK_PRINT_FIRST_N 20
 #define NACK_PRINT_INTERVAL 100
 
-/* --- 参数枚举：保留原接口，方便Host侧查看/设置 --- */
+/* The RTT-specific rate parameters are compile-time values. */
 typedef enum {
-    SIMPLE_CC_PARAM_MD = 0,
-    SIMPLE_CC_PARAM_AI_HIGH = 1,
-    SIMPLE_CC_PARAM_AI_LOW = 2,
-    SIMPLE_CC_PARAM_MIN_RATE = 3,
+    SIMPLE_CC_PARAM_MODE = 0,
     SIMPLE_CC_PARAM_NUM
 } simple_cc_params_t;
 
@@ -70,10 +91,7 @@ enum {
 static const volatile char simple_cc_desc[] =
     "OWD-only CC with NACK 10 percent decrease and runtime RTT parameter switching";
 
-static const volatile char simple_cc_param_md_desc[] = "Default MD factor";
-static const volatile char simple_cc_param_ai_high_desc[] = "Default AI HIGH";
-static const volatile char simple_cc_param_ai_low_desc[] = "Default AI LOW";
-static const volatile char simple_cc_param_min_rate_desc[] = "Default Min Rate";
+static const volatile char simple_cc_param_mode_desc[] = "LongCC ablation mode (0=core,1=legacy,2=FWS,3=TRA)";
 
 static const volatile char simple_cc_counter_events_desc[] = "Events";
 static const volatile char simple_cc_counter_nacks_desc[] = "NACKs";
@@ -83,7 +101,6 @@ void simple_cc_init(uint32_t algo_idx)
 {
     struct doca_pcc_dev_algo_meta_data algo_def = {0};
     const simple_cc_rtt_params_t *default_params;
-    uint32_t param_num;
     uint32_t counter_num;
 
     default_params =
@@ -100,43 +117,14 @@ void simple_cc_init(uint32_t algo_idx)
                                     SIMPLE_CC_PARAM_NUM,
                                     SIMPLE_CC_COUNTER_NUM);
 
-    param_num = 0;
-
     doca_pcc_dev_algo_init_param(algo_idx,
-                                 param_num++,
-                                 default_params->md_fxp16,
-                                 SIMPLE_CC_MD_MAX,
+                                 SIMPLE_CC_PARAM_MODE,
+                                 LONGCC_DEFAULT_MODE,
+                                 LONGCC_MODE_TRA_ONLY,
+                                 LONGCC_MODE_CORE,
                                  1,
-                                 1,
-                                 sizeof(simple_cc_param_md_desc),
-                                 (uint64_t)simple_cc_param_md_desc);
-
-    doca_pcc_dev_algo_init_param(algo_idx,
-                                 param_num++,
-                                 default_params->ai_fxp20,
-                                 SIMPLE_CC_AI_MAX,
-                                 1,
-                                 1,
-                                 sizeof(simple_cc_param_ai_high_desc),
-                                 (uint64_t)simple_cc_param_ai_high_desc);
-
-    doca_pcc_dev_algo_init_param(algo_idx,
-                                 param_num++,
-                                 default_params->ai_fxp20 / 2,
-                                 SIMPLE_CC_AI_MAX / 2,
-                                 1,
-                                 1,
-                                 sizeof(simple_cc_param_ai_low_desc),
-                                 (uint64_t)simple_cc_param_ai_low_desc);
-
-    doca_pcc_dev_algo_init_param(algo_idx,
-                                 param_num++,
-                                 default_params->min_rate,
-                                 SIMPLE_CC_RATE_MAX,
-                                 default_params->min_rate,
-                                 1,
-                                 sizeof(simple_cc_param_min_rate_desc),
-                                 (uint64_t)simple_cc_param_min_rate_desc);
+                                 sizeof(simple_cc_param_mode_desc),
+                                 (uint64_t)simple_cc_param_mode_desc);
 
     counter_num = 0;
 
@@ -224,6 +212,45 @@ simple_cc_nack_decrease_10(uint32_t cur_rate,
     return cur_rate;
 }
 
+static inline uint8_t
+longcc_update_fws_state(simple_cc_ctxt_t *ctx, int region)
+{
+    if (region > 0) {
+        if (ctx->grow_count < FWS_PERSISTENCE_SAMPLES)
+            ctx->grow_count++;
+        ctx->relief_count = 0;
+        ctx->stable_count = 0;
+        if (ctx->grow_count >= FWS_PERSISTENCE_SAMPLES)
+            ctx->fws_state = LONGCC_FWS_GROWING;
+    } else if (region < 0) {
+        if (ctx->relief_count < FWS_PERSISTENCE_SAMPLES)
+            ctx->relief_count++;
+        ctx->grow_count = 0;
+        ctx->stable_count = 0;
+        if (ctx->relief_count >= FWS_PERSISTENCE_SAMPLES)
+            ctx->fws_state = LONGCC_FWS_RELIEVING;
+    } else {
+        if (ctx->stable_count < FWS_PERSISTENCE_SAMPLES)
+            ctx->stable_count++;
+        ctx->grow_count = 0;
+        ctx->relief_count = 0;
+        if (ctx->stable_count >= FWS_PERSISTENCE_SAMPLES)
+            ctx->fws_state = LONGCC_FWS_STABLE;
+    }
+
+    return ctx->fws_state;
+}
+
+static inline int
+longcc_delay_md_allowed(const simple_cc_ctxt_t *ctx, uint32_t event_ts)
+{
+    if (!ctx->md_timestamp_valid || ctx->rtt_ewma_ns == 0)
+        return 1;
+
+    /* Unsigned subtraction handles the 32-bit nanosecond timestamp wrap. */
+    return (uint32_t)(event_ts - ctx->last_md_timestamp) >= ctx->rtt_ewma_ns;
+}
+
 /* --- 新流初始化 --- */
 static inline void
 simple_cc_handle_new_flow(simple_cc_ctxt_t *ctx,
@@ -236,14 +263,15 @@ simple_cc_handle_new_flow(simple_cc_ctxt_t *ctx,
 
     ctx->cur_rate = cc_params->min_rate;
 
-    ctx->flags.was_cnp = 0;
-    ctx->flags.was_nack = 0;
-
     /* OWD / RTT状态初始化 */
-    ctx->owd_baseline = OWD_BASELINE_INIT;
     ctx->owd_diff = 0;
     ctx->owd_hai_counter = 0;
-    ctx->prev_owd = 0;
+    ctx->fws_state = LONGCC_FWS_STABLE;
+    ctx->grow_count = 0;
+    ctx->relief_count = 0;
+    ctx->stable_count = 0;
+    ctx->last_md_timestamp = 0;
+    ctx->md_timestamp_valid = 0;
 
     ctx->last_req_send_time = 0;
     ctx->last_rev_time = 0;
@@ -280,7 +308,13 @@ void simple_cc_algo(doca_pcc_dev_event_t *event,
 
     uint32_t ev_type = ev_attr.ev_type;
     uint32_t cur_rate;
+    uint32_t mode;
+    uint32_t control_ts = 0;
     int decrease = 0;
+    int hold_rate = 0;
+    int region;
+    int use_fws;
+    int use_cooldown;
 
     const simple_cc_rtt_params_t *cc_params;
     uint32_t ai_factor;
@@ -295,6 +329,11 @@ void simple_cc_algo(doca_pcc_dev_event_t *event,
     }
 
     cur_rate = ctx->cur_rate;
+    mode = (param != NULL) ? param[SIMPLE_CC_PARAM_MODE] : LONGCC_MODE_CORE;
+    if (mode > LONGCC_MODE_TRA_ONLY)
+        mode = LONGCC_MODE_CORE;
+    use_fws = (mode == LONGCC_MODE_CORE || mode == LONGCC_MODE_FWS_ONLY);
+    use_cooldown = (mode == LONGCC_MODE_CORE || mode == LONGCC_MODE_TRA_ONLY);
 
     /*
      * 根据当前RTT档位选择参数。
@@ -303,17 +342,14 @@ void simple_cc_algo(doca_pcc_dev_event_t *event,
     cc_params = simple_cc_select_params_by_rtt_class(ctx->rtt_class_ms);
     ai_factor = cc_params->ai_fxp20 / 2;
 
-    /* 调试打印参数，避免param为NULL时访问 */
+    /* Print the active ablation mode and RTT-specific compile-time parameters. */
     {
         static int print_once = 0;
 
         if (param != NULL && print_once < 3) {
             doca_pcc_dev_printf(
-                "DEBUG PARAM META: MD=%u, AI_HIGH=%u, AI_LOW=%u, MIN_RATE=%u\n",
-                param[SIMPLE_CC_PARAM_MD],
-                param[SIMPLE_CC_PARAM_AI_HIGH],
-                param[SIMPLE_CC_PARAM_AI_LOW],
-                param[SIMPLE_CC_PARAM_MIN_RATE]);
+                "DEBUG PARAM META: mode=%u (0=core,1=legacy,2=FWS,3=TRA)\n",
+                mode);
 
             doca_pcc_dev_printf(
                 "DEBUG RUNTIME PARAM: class=%u ms, OWD_HIGH=%d ns, OWD_LOW=%d ns, MD=%u, AI=%u, MIN_RATE=%u\n",
@@ -348,7 +384,6 @@ void simple_cc_algo(doca_pcc_dev_event_t *event,
 
         cc_params = simple_cc_select_params_by_rtt_class(ctx->rtt_class_ms);
 
-        ctx->flags.was_nack = 1;
         ctx->owd_hai_counter = 0;
 
         cur_rate = simple_cc_nack_decrease_10(ctx->cur_rate, cc_params);
@@ -421,6 +456,18 @@ void simple_cc_algo(doca_pcc_dev_event_t *event,
         event_ts = doca_pcc_dev_get_timestamp(event);
         rtt_sample_ns = event_ts - start_ts;
 
+        if (rtt_sample_ns == 0 || rtt_sample_ns > LONGCC_MAX_SAMPLE_INTERVAL_NS) {
+            ctx->rtt_valid = 0;
+            ctx->owd_diff = 0;
+            ctx->grow_count = 0;
+            ctx->relief_count = 0;
+            ctx->stable_count = 0;
+            ctx->fws_state = LONGCC_FWS_STABLE;
+            results->rate = ctx->cur_rate;
+            results->rtt_req = 1;
+            return;
+        }
+
         ctx->rtt_ewma_ns = simple_cc_update_rtt_ewma_ns(
             ctx->rtt_ewma_ns,
             rtt_sample_ns);
@@ -463,11 +510,35 @@ void simple_cc_algo(doca_pcc_dev_event_t *event,
          *
          * 这里利用uint32_t自然回绕计算，再转int32_t。
          */
-        delta_owd = (int32_t)((req_rev_time - ctx->last_rev_time) -
-                              (start_ts - ctx->last_req_send_time));
+        {
+            uint32_t send_interval = start_ts - ctx->last_req_send_time;
+            uint32_t recv_interval = req_rev_time - ctx->last_rev_time;
+            int64_t interval_delta = (int64_t)recv_interval - send_interval;
+
+            /* A missing or discontinuous timestamp must not drive a rate update. */
+            if (send_interval == 0 || recv_interval == 0 ||
+                send_interval > LONGCC_MAX_SAMPLE_INTERVAL_NS ||
+                recv_interval > LONGCC_MAX_SAMPLE_INTERVAL_NS ||
+                interval_delta > (int64_t)LONGCC_MAX_SAMPLE_INTERVAL_NS ||
+                interval_delta < -(int64_t)LONGCC_MAX_SAMPLE_INTERVAL_NS) {
+                ctx->last_req_send_time = start_ts;
+                ctx->last_rev_time = req_rev_time;
+                ctx->owd_diff = 0;
+                ctx->grow_count = 0;
+                ctx->relief_count = 0;
+                ctx->stable_count = 0;
+                ctx->fws_state = LONGCC_FWS_STABLE;
+                results->rate = ctx->cur_rate;
+                results->rtt_req = 1;
+                return;
+            }
+
+            delta_owd = (int32_t)interval_delta;
+        }
 
         ctx->last_req_send_time = start_ts;
         ctx->last_rev_time = req_rev_time;
+        control_ts = event_ts;
     }
 
     /*
@@ -497,23 +568,37 @@ void simple_cc_algo(doca_pcc_dev_event_t *event,
      */
     cc_params = simple_cc_select_params_by_rtt_class(ctx->rtt_class_ms);
 
-    if (filt_owd > cc_params->owd_high_thresh) {
+    if (filt_owd > cc_params->owd_high_thresh)
+        region = 1;
+    else if (filt_owd < cc_params->owd_low_thresh)
+        region = -1;
+    else
+        region = 0;
+
+    longcc_update_fws_state(ctx, region);
+
+    /* During a pending state transition, retain the rate until the trend persists. */
+    if (use_fws &&
+        ((region > 0 && ctx->fws_state != LONGCC_FWS_GROWING) ||
+         (region < 0 && ctx->fws_state != LONGCC_FWS_RELIEVING) ||
+         (region == 0 && ctx->fws_state != LONGCC_FWS_STABLE))) {
+        hold_rate = 1;
+    }
+
+    if (region > 0) {
         decrease = 1;
         ctx->owd_hai_counter = 0;
-        ai_factor = cc_params->ai_fxp20 / 2;
-    } else if (filt_owd < cc_params->owd_low_thresh) {
-        ctx->owd_hai_counter++;
-
-        if (ctx->owd_hai_counter >= OWD_HAI_THRESH) {
-            /* 保守HAI：2x AI */
-            ai_factor = cc_params->ai_fxp20 * 2;
-        } else {
-            ai_factor = cc_params->ai_fxp20;
-        }
+    } else if (region < 0 && !hold_rate) {
+        if (ctx->owd_hai_counter < OWD_HAI_THRESH)
+            ctx->owd_hai_counter++;
+        ai_factor = (ctx->owd_hai_counter >= OWD_HAI_THRESH) ?
+                    cc_params->ai_fxp20 * 2 : cc_params->ai_fxp20;
     } else {
         ctx->owd_hai_counter = 0;
-        ai_factor = cc_params->ai_fxp20 / 2;
     }
+
+    if (decrease && use_cooldown && !longcc_delay_md_allowed(ctx, control_ts))
+        hold_rate = 1;
 
     {
         static uint32_t owd_print = 0;
@@ -537,8 +622,9 @@ void simple_cc_algo(doca_pcc_dev_event_t *event,
                 cc_params->min_rate);
 
             doca_pcc_dev_printf(
-                "cur_rate(before step)=%u\n",
-                cur_rate);
+                "mode=%u, region=%d, state=%u, grow=%u, relief=%u, hold=%d, rate=%u\n",
+                mode, region, ctx->fws_state, ctx->grow_count,
+                ctx->relief_count, hold_rate, cur_rate);
         }
     }
 
@@ -548,7 +634,13 @@ void simple_cc_algo(doca_pcc_dev_event_t *event,
      * RTT/OWD拥塞判断使用simple_cc_step()
      * NACK降速使用simple_cc_nack_decrease_10()
      */
-    cur_rate = simple_cc_step(cur_rate, decrease, ai_factor, cc_params);
+    if (!hold_rate) {
+        cur_rate = simple_cc_step(cur_rate, decrease, ai_factor, cc_params);
+        if (decrease) {
+            ctx->last_md_timestamp = control_ts;
+            ctx->md_timestamp_valid = 1;
+        }
+    }
 
     /*
      * 7. 更新上下文与结果
@@ -568,20 +660,14 @@ simple_cc_set_algo_params(uint32_t param_id_base,
                           const uint32_t *new_param_values,
                           uint32_t *params)
 {
-    uint32_t i;
-
-    if (param_num > SIMPLE_CC_PARAM_NUM || param_id_base >= SIMPLE_CC_PARAM_NUM)
-        return DOCA_PCC_DEV_STATUS_FAIL;
-
     if (new_param_values == NULL || params == NULL)
         return DOCA_PCC_DEV_STATUS_FAIL;
 
-    if (param_id_base + param_num > SIMPLE_CC_PARAM_NUM)
+    if (param_id_base != SIMPLE_CC_PARAM_MODE || param_num != 1 ||
+        new_param_values[0] > LONGCC_MODE_TRA_ONLY)
         return DOCA_PCC_DEV_STATUS_FAIL;
 
-    for (i = 0; i < param_num; i++) {
-        params[param_id_base + i] = new_param_values[i];
-    }
+    params[SIMPLE_CC_PARAM_MODE] = new_param_values[0];
 
     return DOCA_PCC_DEV_STATUS_OK;
 }

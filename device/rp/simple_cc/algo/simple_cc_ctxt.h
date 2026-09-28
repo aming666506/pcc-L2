@@ -4,18 +4,19 @@
 #include <stdint.h>
 
 typedef struct {
-    struct {
-        uint8_t was_cnp;
-        uint8_t was_nack;
-    } flags;
-
     uint32_t cur_rate;
 
-    /* OWD相关状态 */
-    uint32_t owd_baseline;
+    /* Forward-delay trend state and persistence counters. */
     int32_t  owd_diff;
     uint32_t owd_hai_counter;
-    uint32_t prev_owd;
+    uint8_t  fws_state;
+    uint8_t  grow_count;
+    uint8_t  relief_count;
+    uint8_t  stable_count;
+
+    /* Limit delay-triggered multiplicative decreases to one per RTT. */
+    uint32_t last_md_timestamp;
+    uint8_t  md_timestamp_valid;
 
     /* RTT/OWD历史时间戳 */
     uint32_t last_req_send_time;
